@@ -1,0 +1,14 @@
+{
+  "name": "keiri-tools",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bbg:dry-run": "node tools/buddyboardgames/autoplay.mjs --dry-run",
+    "bbg:autoplay": "node tools/buddyboardgames/autoplay.mjs --execute",
+    "bbg:join": "node tools/buddyboardgames/autoplay.mjs --join-only --headed --keep-open"
+  },
+  "devDependencies": {
+    "playwright": "1.59.1"
+  }
+}

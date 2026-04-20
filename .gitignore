@@ -1,0 +1,16 @@
+# Build outputs
+/target
+/node_modules
+/.playwright-cli
+.omx/
+.playwright-cli/
+.idea/
+.openclaude/
+logs/
+
+# IDE
+.idea/
+*.iml
+
+# OS
+.DS_Store

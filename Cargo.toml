@@ -1,0 +1,10 @@
+[package]
+name = "keiri"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[[bench]]
+name = "oracle"
+harness = false
