@@ -97,9 +97,12 @@ cargo run -- bbg-loop room=my-room-code player=Keiri
 
 Stop the loop with Ctrl-C or `SIGTERM` to get a final session summary. The
 helper now requests a graceful stop first, then reports the number of completed
-games, the highest score seen, and the mean score. If Python plus `matplotlib`
-are available, it writes a PNG score-history chart with a dashed mean line to
-`target/bbg-reports/`; otherwise it falls back to a terminal graph.
+games, the highest score seen, and the mean score. It writes a PNG
+score-history chart with a dashed mean line to `target/bbg-reports/`. If
+`matplotlib` is missing, the helper first reuses an existing virtual
+environment when present; otherwise it creates a repo-local `.venv` with `uv`
+and installs `matplotlib` there. When `uv` is unavailable, it falls back to
+`pip`.
 
 Dry run:
 

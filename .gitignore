@@ -2,6 +2,7 @@
 /target
 /node_modules
 /.playwright-cli
+/.venv
 .omx/
 .playwright-cli/
 .idea/

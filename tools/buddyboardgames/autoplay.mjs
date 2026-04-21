@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -88,48 +88,6 @@ export function meanScore(scores) {
   return scores.reduce((sum, score) => sum + score, 0) / scores.length;
 }
 
-export function renderScoreGraph(scores, options = {}) {
-  if (!scores.length) {
-    return "score graph: no completed games";
-  }
-
-  const height = Math.max(4, Math.min(16, options.height || 10));
-  const maxWidth = Math.max(8, options.maxWidth || 60);
-  const points = compressScoresForGraph(scores, maxWidth);
-  const values = points.map((point) => point.value);
-  const mean = meanScore(scores);
-  const minValue = Math.min(...values, mean);
-  const maxValue = Math.max(...values, mean);
-  const span = Math.max(1, maxValue - minValue);
-  const valueToRow = (value) => {
-    if (maxValue === minValue) {
-      return Math.floor(height / 2);
-    }
-    return Math.round(((maxValue - value) * (height - 1)) / span);
-  };
-
-  const grid = Array.from({ length: height }, () => Array(points.length).fill(" "));
-  const meanRow = valueToRow(mean);
-  for (let column = 0; column < points.length; column += 1) {
-    grid[meanRow][column] = column % 2 === 0 ? "-" : " ";
-  }
-  for (let column = 0; column < points.length; column += 1) {
-    const pointRow = valueToRow(points[column].value);
-    grid[pointRow][column] = "*";
-  }
-
-  const lines = ["score graph:"];
-  for (let row = 0; row < height; row += 1) {
-    const labelValue = maxValue - (span * row) / Math.max(1, height - 1);
-    const meanLabel = row === meanRow ? " mean" : "";
-    lines.push(`${String(Math.round(labelValue)).padStart(4, " ")} | ${grid[row].join("")}${meanLabel}`);
-  }
-
-  lines.push(`     +-${"-".repeat(points.length)}`);
-  lines.push(`       games 1..${scores.length}${points.length < scores.length ? ` (compressed to ${points.length} columns)` : ""}`);
-  return lines.join("\n");
-}
-
 export function formatScoreSummary(scores, options = {}) {
   const reason = options.reason || "stopped";
   if (!scores.length) {
@@ -138,10 +96,9 @@ export function formatScoreSummary(scores, options = {}) {
       "completed_games: 0",
       "highest_score: n/a",
       "mean_score: n/a",
-      "score graph: no completed games",
     ];
     if (options.chartUnavailableReason) {
-      lines.push(`chart_renderer: unavailable (${options.chartUnavailableReason})`);
+      lines.push(`score_graph_png: unavailable (${options.chartUnavailableReason})`);
     }
     return lines.join("\n");
   }
@@ -156,11 +113,8 @@ export function formatScoreSummary(scores, options = {}) {
   ];
   if (options.chartPath) {
     lines.push(`score_graph_png: ${options.chartPath}`);
-  } else {
-    lines.push(renderScoreGraph(scores, options));
-    if (options.chartUnavailableReason) {
-      lines.push(`chart_renderer: unavailable (${options.chartUnavailableReason})`);
-    }
+  } else if (options.chartUnavailableReason) {
+    lines.push(`score_graph_png: unavailable (${options.chartUnavailableReason})`);
   }
   return lines.join("\n");
 }
@@ -183,7 +137,6 @@ async function main() {
   const stopController = createStopController({
     onRequestStop: (reason) => {
       process.stdout.write(`\nstop requested: ${reason}; finishing current step...\n`);
-      process.stdout.write(`${session.emitSummary({ reason, forceChartAttempt: true })}\n`);
     },
     onForceStop: (reason) => {
       process.stdout.write(`\nforcing shutdown after ${reason}\n`);
@@ -750,26 +703,6 @@ function createStopController(options = {}) {
   };
 }
 
-function compressScoresForGraph(scores, maxWidth) {
-  if (scores.length <= maxWidth) {
-    return scores.map((value, index) => ({ value, start: index + 1, end: index + 1 }));
-  }
-
-  const bucketSize = scores.length / maxWidth;
-  const points = [];
-  for (let column = 0; column < maxWidth; column += 1) {
-    const start = Math.floor(column * bucketSize);
-    const end = Math.min(scores.length, Math.floor((column + 1) * bucketSize));
-    const slice = scores.slice(start, Math.max(start + 1, end));
-    points.push({
-      value: meanScore(slice),
-      start: start + 1,
-      end: Math.max(start + 1, end),
-    });
-  }
-  return points;
-}
-
 function createLoopSession() {
   const scores = [];
   const signatures = new Set();
@@ -820,10 +753,11 @@ function createLoopSession() {
 }
 
 function tryRenderScoreChart(scores) {
-  const python = findPythonExecutable();
-  if (!python) {
-    return { ok: false, reason: "python3 not available" };
+  const environment = ensureMatplotlibEnvironment();
+  if (!environment.ok) {
+    return { ok: false, reason: environment.reason };
   }
+  const python = environment.python;
 
   const reportsDir = resolve(repoRoot, "target/bbg-reports");
   mkdirSync(reportsDir, { recursive: true });
@@ -876,21 +810,203 @@ print(output_path)
   }
 }
 
-function findPythonExecutable() {
-  for (const candidate of [process.env.PYTHON, "python3", "python"]) {
-    if (!candidate) continue;
+export function ensureMatplotlibEnvironment(options = {}) {
+  const runner = options.execFileSync || execFileSync;
+  const root = resolve(options.repoRoot || repoRoot);
+  const existingEnvironments = discoverVirtualEnvironments(root);
+  const pythonCandidates = discoverPythonExecutables(root, existingEnvironments);
+
+  for (const candidate of pythonCandidates) {
+    if (pythonHasModule(runner, candidate, "matplotlib", root)) {
+      return { ok: true, python: candidate, source: "existing" };
+    }
+  }
+
+  const existingVirtualEnv = existingEnvironments.find((envPath) =>
+    pythonIsRunnable(runner, virtualEnvPython(envPath), root),
+  );
+  if (existingVirtualEnv) {
+    const python = virtualEnvPython(existingVirtualEnv);
+    const installed = installMatplotlib(runner, {
+      python,
+      repoRoot: root,
+      preferUser: false,
+    });
+    if (!installed.ok) {
+      return installed;
+    }
+    if (pythonHasModule(runner, python, "matplotlib", root)) {
+      return { ok: true, python, source: "existing-venv" };
+    }
+    return { ok: false, reason: "matplotlib install completed but import still failed" };
+  }
+
+  if (commandAvailable(runner, "uv", root)) {
+    const venvPath = resolve(root, ".venv");
     try {
-      execFileSync(candidate, ["-c", "import sys; print(sys.version_info[0])"], {
-        cwd: repoRoot,
+      runner("uv", ["venv", venvPath], {
+        cwd: root,
         encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
+        stdio: ["ignore", "pipe", "pipe"],
       });
+    } catch (error) {
+      return { ok: false, reason: `uv venv failed: ${normalizeCommandError(error)}` };
+    }
+    const python = virtualEnvPython(venvPath);
+    const installed = installMatplotlib(runner, {
+      python,
+      repoRoot: root,
+      preferUser: false,
+    });
+    if (!installed.ok) {
+      return installed;
+    }
+    if (pythonHasModule(runner, python, "matplotlib", root)) {
+      return { ok: true, python, source: "uv-created-venv" };
+    }
+    return { ok: false, reason: "matplotlib install completed but import still failed" };
+  }
+
+  const python = findPythonExecutable(runner, pythonCandidates, root);
+  if (!python) {
+    return { ok: false, reason: "python3 not available" };
+  }
+  const installed = installMatplotlib(runner, {
+    python,
+    repoRoot: root,
+    preferUser: !pythonLooksVirtualEnv(python),
+  });
+  if (!installed.ok) {
+    return installed;
+  }
+  if (pythonHasModule(runner, python, "matplotlib", root)) {
+    return { ok: true, python, source: "pip-install" };
+  }
+  return { ok: false, reason: "matplotlib install completed but import still failed" };
+}
+
+function discoverVirtualEnvironments(root) {
+  const candidates = [];
+  if (process.env.VIRTUAL_ENV) {
+    candidates.push(resolve(process.env.VIRTUAL_ENV));
+  }
+  for (const directory of [".venv", "venv", "env"]) {
+    const envPath = resolve(root, directory);
+    if (existsSync(envPath)) {
+      candidates.push(envPath);
+    }
+  }
+  return [...new Set(candidates)];
+}
+
+function discoverPythonExecutables(root, virtualEnvironments = discoverVirtualEnvironments(root)) {
+  const candidates = [];
+  for (const envPath of virtualEnvironments) {
+    candidates.push(virtualEnvPython(envPath));
+  }
+  if (process.env.PYTHON) {
+    candidates.push(process.env.PYTHON);
+  }
+  candidates.push("python3", "python");
+  return [...new Set(candidates)];
+}
+
+function virtualEnvPython(envPath) {
+  return process.platform === "win32"
+    ? join(envPath, "Scripts", "python.exe")
+    : join(envPath, "bin", "python");
+}
+
+function findPythonExecutable(runner, candidates, root) {
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    if (pythonIsRunnable(runner, candidate, root)) {
       return candidate;
-    } catch {
-      continue;
     }
   }
   return "";
+}
+
+function pythonIsRunnable(runner, python, root) {
+  try {
+    runner(python, ["-c", "import sys; print(sys.version_info[0])"], {
+      cwd: root,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function pythonHasModule(runner, python, moduleName, root) {
+  if (!pythonIsRunnable(runner, python, root)) {
+    return false;
+  }
+  try {
+    runner(python, ["-c", `import ${moduleName}`], {
+      cwd: root,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function commandAvailable(runner, command, root) {
+  try {
+    runner(command, ["--version"], {
+      cwd: root,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function installMatplotlib(runner, options) {
+  if (commandAvailable(runner, "uv", options.repoRoot)) {
+    try {
+      runner("uv", ["pip", "install", "--python", options.python, "matplotlib"], {
+        cwd: options.repoRoot,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, reason: `uv pip install matplotlib failed: ${normalizeCommandError(error)}` };
+    }
+  }
+
+  const pipArgs = ["-m", "pip", "install"];
+  if (options.preferUser) {
+    pipArgs.push("--user");
+  }
+  pipArgs.push("matplotlib");
+  try {
+    runner(options.python, pipArgs, {
+      cwd: options.repoRoot,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, reason: `pip install matplotlib failed: ${normalizeCommandError(error)}` };
+  }
+}
+
+function pythonLooksVirtualEnv(python) {
+  const normalized = python.replace(/\\/g, "/");
+  return normalized.includes("/.venv/") || normalized.includes("/venv/") || normalized.includes("/env/");
+}
+
+function normalizeCommandError(error) {
+  return String(error.stderr || error.message || "unknown command error").trim().replace(/\s+/g, " ");
 }
 
 function timestampSlug() {
