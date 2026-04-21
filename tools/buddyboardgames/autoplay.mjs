@@ -4,88 +4,20 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
+const modulePath = fileURLToPath(import.meta.url);
+const __dirname = dirname(modulePath);
 const repoRoot = resolve(__dirname, "../..");
 
-const args = parseArgs(process.argv.slice(2));
-const dryRun = !args.execute;
-const url = args.url || "https://www.buddyboardgames.com/yahtzee";
-const oracleEndgame = args.oracleEndgame || "2";
-const agent = args.agent || "auto";
-const table = args.table || "target/keiri_tables/bbg-anchor-v1.bin";
-const traceDir = args.traceDir || "target/bbg-traces";
-const joinOnly = Boolean(args.joinOnly);
-const loop = Boolean(args.loop);
-
-let chromium;
-try {
-  ({ chromium } = await import("playwright"));
-} catch (error) {
-  console.error("Playwright is required for BuddyBoardGames autoplay.");
-  console.error("Run with: npx --yes --package playwright node tools/buddyboardgames/autoplay.mjs --dry-run");
-  console.error(error.message);
-  process.exit(2);
+if (isMainModule()) {
+  await main().catch((error) => {
+    console.error(error.message);
+    process.exit(1);
+  });
 }
 
-const browser = await chromium.launch({ headless: args.headed ? false : true });
-const page = await browser.newPage();
+export const DEFAULT_PLAYER_NAME = "Keiri";
 
-try {
-  await page.goto(url, { waitUntil: "domcontentloaded" });
-
-  if (args.player || args.room) {
-    await joinRoom(page, args.player, args.room, {
-      startGame: args.startGame,
-      autoStartSolo: args.autoStartSolo,
-    });
-  }
-
-  if (loop) {
-    console.log(`joined: ${args.room || "(page default room)"}`);
-    console.log(`player: ${args.player || "(page default player)"}`);
-    console.log("status: autoplay-loop");
-    await autoplayLoop(page, {
-      oracleEndgame,
-      agent,
-      table,
-      traceDir,
-      pollMs: Number(args.pollMs || 1000),
-      maxActions: args.maxActions ? Number(args.maxActions) : Infinity,
-      dryRun,
-    });
-  } else if (joinOnly) {
-    console.log(`joined: ${args.room || "(page default room)"}`);
-    console.log(`player: ${args.player || "(page default player)"}`);
-    console.log("status: connected");
-    if (args.keepOpen) {
-      console.log("keeping browser open; press Ctrl-C to stop");
-      await waitUntilStopped(page);
-    }
-  } else {
-    await page.waitForTimeout(Number(args.waitMs || 500));
-    const snapshot = await readSnapshot(page);
-    if (args.probe) {
-      console.log(JSON.stringify(snapshot.probe, null, 2));
-    }
-    const advice = runKeiriAdvice(snapshot.tokens, { oracleEndgame, agent, table });
-
-    console.log(advice.raw.trim());
-
-    if (dryRun) {
-      console.log("dry_run: true");
-    } else {
-      const before = snapshot.tokens;
-      await applyAdvice(page, advice);
-      const after = await readSnapshot(page).catch((error) => ({ error: error.message }));
-      writeTrace(traceDir, { before, advice: advice.raw, parsed: advice, after, dryRun: false });
-      console.log("executed: true");
-    }
-  }
-} finally {
-  await browser.close();
-}
-
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const parsed = {};
   for (const arg of argv) {
     if (arg === "--execute") parsed.execute = true;
@@ -93,6 +25,7 @@ function parseArgs(argv) {
     else if (arg === "--headed") parsed.headed = true;
     else if (arg === "--join-only") parsed.joinOnly = true;
     else if (arg === "--loop") parsed.loop = true;
+    else if (arg === "--restart-games") parsed.restartGames = true;
     else if (arg === "--keep-open") parsed.keepOpen = true;
     else if (arg === "--start-game") parsed.startGame = true;
     else if (arg === "--auto-start-solo") parsed.autoStartSolo = true;
@@ -112,15 +45,269 @@ function parseArgs(argv) {
   return parsed;
 }
 
+export function classifyProbeState(probe) {
+  const gameState = String(probe.gameState || "");
+  if (gameState === "ENDED" || probe.turnsLeft === 0) {
+    return { ready: false, ended: true, reason: "ended" };
+  }
+  if (gameState !== "STARTED") {
+    return {
+      ready: false,
+      ended: false,
+      reason: gameState ? `gameState=${gameState}` : "gameState=unknown",
+    };
+  }
+  if (probe.isSpectator) {
+    return { ready: false, ended: false, reason: "spectator" };
+  }
+  if (Number(probe.meIdx) !== Number(probe.turnIdx)) {
+    return {
+      ready: false,
+      ended: false,
+      reason: `not my turn me=${probe.meIdx} turn=${probe.turnIdx}`,
+    };
+  }
+  if (probe.rollPending) {
+    return { ready: false, ended: false, reason: "roll/update pending" };
+  }
+  return { ready: true, ended: false, reason: "ready" };
+}
+
+export function formatGuardStatus(status) {
+  if (status.ended) {
+    return ["status: game-ended"];
+  }
+  if (status.ready) {
+    return ["status: ready"];
+  }
+  return ["status: waiting", `reason: ${status.reason}`];
+}
+
+export function meanScore(scores) {
+  if (!scores.length) return 0;
+  return scores.reduce((sum, score) => sum + score, 0) / scores.length;
+}
+
+export function renderScoreGraph(scores, options = {}) {
+  if (!scores.length) {
+    return "score graph: no completed games";
+  }
+
+  const height = Math.max(4, Math.min(16, options.height || 10));
+  const maxWidth = Math.max(8, options.maxWidth || 60);
+  const points = compressScoresForGraph(scores, maxWidth);
+  const values = points.map((point) => point.value);
+  const mean = meanScore(scores);
+  const minValue = Math.min(...values, mean);
+  const maxValue = Math.max(...values, mean);
+  const span = Math.max(1, maxValue - minValue);
+  const valueToRow = (value) => {
+    if (maxValue === minValue) {
+      return Math.floor(height / 2);
+    }
+    return Math.round(((maxValue - value) * (height - 1)) / span);
+  };
+
+  const grid = Array.from({ length: height }, () => Array(points.length).fill(" "));
+  const meanRow = valueToRow(mean);
+  for (let column = 0; column < points.length; column += 1) {
+    grid[meanRow][column] = column % 2 === 0 ? "-" : " ";
+  }
+  for (let column = 0; column < points.length; column += 1) {
+    const pointRow = valueToRow(points[column].value);
+    grid[pointRow][column] = "*";
+  }
+
+  const lines = ["score graph:"];
+  for (let row = 0; row < height; row += 1) {
+    const labelValue = maxValue - (span * row) / Math.max(1, height - 1);
+    const meanLabel = row === meanRow ? " mean" : "";
+    lines.push(`${String(Math.round(labelValue)).padStart(4, " ")} | ${grid[row].join("")}${meanLabel}`);
+  }
+
+  lines.push(`     +-${"-".repeat(points.length)}`);
+  lines.push(`       games 1..${scores.length}${points.length < scores.length ? ` (compressed to ${points.length} columns)` : ""}`);
+  return lines.join("\n");
+}
+
+export function formatScoreSummary(scores, options = {}) {
+  const reason = options.reason || "stopped";
+  if (!scores.length) {
+    const lines = [
+      `session stopped: ${reason}`,
+      "completed_games: 0",
+      "highest_score: n/a",
+      "mean_score: n/a",
+      "score graph: no completed games",
+    ];
+    if (options.chartUnavailableReason) {
+      lines.push(`chart_renderer: unavailable (${options.chartUnavailableReason})`);
+    }
+    return lines.join("\n");
+  }
+
+  const highest = Math.max(...scores);
+  const mean = meanScore(scores);
+  const lines = [
+    `session stopped: ${reason}`,
+    `completed_games: ${scores.length}`,
+    `highest_score: ${highest}`,
+    `mean_score: ${mean.toFixed(2)}`,
+  ];
+  if (options.chartPath) {
+    lines.push(`score_graph_png: ${options.chartPath}`);
+  } else {
+    lines.push(renderScoreGraph(scores, options));
+    if (options.chartUnavailableReason) {
+      lines.push(`chart_renderer: unavailable (${options.chartUnavailableReason})`);
+    }
+  }
+  return lines.join("\n");
+}
+
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  const dryRun = !args.execute;
+  const url = args.url || "https://www.buddyboardgames.com/yahtzee";
+  const oracleEndgame = args.oracleEndgame || "2";
+  const agent = args.agent || "auto";
+  const table = args.table || "target/keiri_tables/bbg-anchor-v1.bin";
+  const traceDir = args.traceDir || "target/bbg-traces";
+  const joinOnly = Boolean(args.joinOnly);
+  const loop = Boolean(args.loop);
+  const hasExplicitPlayer = Boolean(args.player);
+  const player = args.player || DEFAULT_PLAYER_NAME;
+  const room = args.room;
+  const playerLabel = room || hasExplicitPlayer ? player : "(page default player)";
+  const session = createLoopSession();
+  const stopController = createStopController({
+    onRequestStop: (reason) => {
+      process.stdout.write(`\nstop requested: ${reason}; finishing current step...\n`);
+      process.stdout.write(`${session.emitSummary({ reason, forceChartAttempt: true })}\n`);
+    },
+    onForceStop: (reason) => {
+      process.stdout.write(`\nforcing shutdown after ${reason}\n`);
+      process.stdout.write(`${session.emitSummary({ reason, forceChartAttempt: true })}\n`);
+    },
+  });
+
+  let chromium;
+  try {
+    ({ chromium } = await import("playwright"));
+  } catch (error) {
+    console.error("Playwright is required for BuddyBoardGames autoplay.");
+    console.error("Run with: npx --yes --package playwright node tools/buddyboardgames/autoplay.mjs --dry-run");
+    throw error;
+  }
+
+  const browser = await chromium.launch({ headless: args.headed ? false : true });
+  const page = await browser.newPage();
+
+  try {
+    await page.goto(url, { waitUntil: "domcontentloaded" });
+
+    if (room || hasExplicitPlayer) {
+      await joinRoom(page, player, room, {
+        startGame: args.startGame,
+        autoStartSolo: args.autoStartSolo,
+      });
+    }
+
+    if (loop) {
+      console.log(`joined: ${room || "(page default room)"}`);
+      console.log(`player: ${playerLabel}`);
+      console.log("status: autoplay-loop");
+      await autoplayLoop(page, {
+        oracleEndgame,
+        agent,
+        table,
+        traceDir,
+        pollMs: Number(args.pollMs || 1000),
+        maxActions: args.maxActions ? Number(args.maxActions) : Infinity,
+        restartGames: Boolean(args.restartGames),
+        autoStartSolo: Boolean(args.autoStartSolo),
+        stopController,
+        session,
+        dryRun,
+      });
+      return;
+    }
+
+    if (joinOnly) {
+      console.log(`joined: ${room || "(page default room)"}`);
+      console.log(`player: ${playerLabel}`);
+      console.log("status: connected");
+      if (args.keepOpen) {
+        console.log("keeping browser open; press Ctrl-C to stop");
+        await waitUntilStopped(page, stopController);
+      }
+      return;
+    }
+
+    await page.waitForTimeout(Number(args.waitMs || 500));
+    const snapshot = await readSnapshot(page);
+    if (args.probe) {
+      console.log(JSON.stringify(snapshot.probe, null, 2));
+    }
+
+    const status = classifyProbeState(snapshot.probe);
+    if (!status.ready) {
+      for (const line of formatGuardStatus(status)) {
+        console.log(line);
+      }
+      if (dryRun) {
+        console.log("dry_run: true");
+      }
+      return;
+    }
+
+    const advice = runKeiriAdvice(snapshot.tokens, { oracleEndgame, agent, table });
+    console.log(advice.raw.trim());
+
+    if (dryRun) {
+      console.log("dry_run: true");
+    } else {
+      const before = snapshot.tokens;
+      await applyAdvice(page, advice);
+      const after = await readSnapshot(page).catch((error) => ({ error: error.message }));
+      writeTrace(traceDir, { before, advice: advice.raw, parsed: advice, after, dryRun: false });
+      console.log("executed: true");
+    }
+  } finally {
+    stopController.dispose();
+    await browser.close();
+  }
+}
+
 async function autoplayLoop(page, options) {
   let actions = 0;
+  let games = 0;
   let lastSkip = "";
+  let stopReason = "";
+  let exitReason = "completed";
 
   while (actions < options.maxActions) {
+    if (options.stopController?.requested()) {
+      stopReason = options.stopController.reason();
+      exitReason = stopReason;
+      break;
+    }
+
     const status = await readLoopStatus(page);
     if (status.ended) {
-      console.log("status: game-ended");
-      return;
+      const recorded = await recordCompletedGameScore(page, options.session);
+      if (recorded !== null) {
+        games = options.session.scores().length;
+        console.log(`game_score: ${recorded} games=${games}`);
+      }
+      if (options.restartGames && await restartFinishedGame(page, options)) {
+        lastSkip = "";
+        console.log(`status: restarted games=${games}`);
+        continue;
+      }
+      exitReason = "game-ended";
+      console.log(`status: game-ended games=${games}`);
+      break;
     }
     if (!status.ready) {
       const skip = `waiting: ${status.reason}`;
@@ -128,7 +315,7 @@ async function autoplayLoop(page, options) {
         console.log(skip);
         lastSkip = skip;
       }
-      await page.waitForTimeout(options.pollMs);
+      await waitWithStop(page, options.pollMs, options.stopController);
       continue;
     }
 
@@ -147,51 +334,83 @@ async function autoplayLoop(page, options) {
         console.log(`executed: true actions=${actions}`);
       }
     } catch (error) {
+      if (options.stopController?.requested()) {
+        stopReason = options.stopController.reason();
+        exitReason = stopReason;
+        break;
+      }
       console.log(`waiting: ${error.message}`);
     }
 
-    await page.waitForTimeout(options.pollMs);
+    await waitWithStop(page, options.pollMs, options.stopController);
   }
 
-  console.log(`status: max-actions reached (${options.maxActions})`);
+  if (!stopReason && options.stopController?.requested()) {
+    stopReason = options.stopController.reason();
+    exitReason = stopReason;
+  }
+  await recordCompletedGameScore(page, options.session).catch(() => null);
+
+  if (actions >= options.maxActions) {
+    exitReason = `max-actions reached (${options.maxActions})`;
+    console.log(`status: ${exitReason}`);
+  } else if (stopReason) {
+    console.log(`status: stop-requested reason=${stopReason}`);
+  }
+
+  const summary = options.session.emitSummary({ reason: exitReason, forceChartAttempt: true });
+  if (summary) {
+    console.log(summary);
+  }
 }
 
 async function readLoopStatus(page) {
+  const probe = await readLoopProbe(page);
+  if (probe.unavailable) {
+    return { ready: false, ended: false, reason: probe.reason };
+  }
+  return classifyProbeState(probe);
+}
+
+async function readLoopProbe(page) {
   return page.evaluate(() => {
     if (typeof thisGame === "undefined" || !thisGame) {
-      return { ready: false, ended: false, reason: "thisGame unavailable" };
+      return { unavailable: true, reason: "thisGame unavailable" };
     }
     const game = thisGame;
-    if (game.gameState === "ENDED" || game.turnsLeft === 0) {
-      return { ready: false, ended: true, reason: "ended" };
-    }
-    if (game.gameState !== "STARTED") {
-      return { ready: false, ended: false, reason: `gameState=${game.gameState}` };
-    }
-    if (game.isSpectator) {
-      return { ready: false, ended: false, reason: "spectator" };
-    }
-    if (game.meIdx !== game.turnIdx) {
-      return { ready: false, ended: false, reason: `not my turn me=${game.meIdx} turn=${game.turnIdx}` };
-    }
-    if (game.rollResultPending || window.yahtzeeRollDiceTimeoutId) {
-      return { ready: false, ended: false, reason: "roll/update pending" };
-    }
-    return { ready: true, ended: false, reason: "ready" };
+    return {
+      gameState: String(game.gameState || ""),
+      meIdx: Number(game.meIdx),
+      turnIdx: Number(game.turnIdx),
+      isSpectator: Boolean(game.isSpectator),
+      rollPending: Boolean(game.rollResultPending || window.yahtzeeRollDiceTimeoutId),
+      turnsLeft: Number(game.turnsLeft),
+    };
   });
 }
 
-function waitUntilStopped(page) {
+function waitUntilStopped(page, stopController = createStopController()) {
   return new Promise((resolve) => {
     let done = false;
+    let poll = null;
     const finish = () => {
       if (!done) {
         done = true;
+        if (poll !== null) {
+          clearInterval(poll);
+        }
         resolve();
       }
     };
-    process.once("SIGINT", finish);
-    process.once("SIGTERM", finish);
+    if (stopController.requested()) {
+      finish();
+      return;
+    }
+    poll = setInterval(() => {
+      if (stopController.requested()) {
+        finish();
+      }
+    }, 100);
     page.once("close", finish);
   });
 }
@@ -227,7 +446,48 @@ async function startLobbyGame(page) {
   if (await start.isVisible().catch(() => false)) {
     await start.click();
     await page.waitForTimeout(800);
+    return true;
   }
+  return false;
+}
+
+async function restartFinishedGame(page, options) {
+  if (await clickIfVisible(page, ".rematch-button")) {
+    await page.waitForTimeout(800);
+    return settleAfterRestart(page, options);
+  }
+
+  if (await clickIfVisible(page, "#gear")) {
+    await page.waitForTimeout(250);
+    if (await clickIfVisible(page, "#restart-button")) {
+      await page.waitForTimeout(800);
+      return settleAfterRestart(page, options);
+    }
+  }
+
+  if (options.autoStartSolo && await isSoloLobby(page)) {
+    return startLobbyGame(page);
+  }
+
+  return false;
+}
+
+async function settleAfterRestart(page, options) {
+  if (options.autoStartSolo && await isSoloLobby(page)) {
+    await startLobbyGame(page);
+  }
+  await page.waitForTimeout(options.pollMs);
+  const status = await readLoopStatus(page);
+  return !status.ended;
+}
+
+async function clickIfVisible(page, selector) {
+  const target = page.locator(selector).first();
+  if (!await target.isVisible().catch(() => false)) {
+    return false;
+  }
+  await domClick(page, selector);
+  return true;
 }
 
 async function readSnapshot(page) {
@@ -262,6 +522,7 @@ async function readSnapshot(page) {
       turnIdx: Number(game.turnIdx),
       isSpectator: Boolean(game.isSpectator),
       rollPending: Boolean(game.rollResultPending || window.yahtzeeRollDiceTimeoutId),
+      turnsLeft: Number(game.turnsLeft),
       rollsUsed: Number(game.playerDiceRollCount || 0),
       dice: game.dice.dice.map((die) => Number(die.value || 1)).join(","),
       selected: game.dice.dice.map((die) => (die.selected ? 1 : 0)).join(","),
@@ -283,6 +544,46 @@ async function readSnapshot(page) {
     ],
     probe: data,
   };
+}
+
+async function recordCompletedGameScore(page, session) {
+  const finished = await readFinishedGameScore(page).catch(() => null);
+  if (!finished) {
+    return null;
+  }
+  return session.recordScore(finished.score, finished.signature);
+}
+
+async function readFinishedGameScore(page) {
+  return page.evaluate(() => {
+    if (typeof thisGame === "undefined" || !thisGame) {
+      throw new Error("BuddyBoardGames thisGame is not available");
+    }
+    const game = thisGame;
+    if (game.gameState !== "ENDED" && Number(game.turnsLeft) !== 0) {
+      throw new Error("game not finished");
+    }
+    if (game.meIdx < 0 || !game.players || !game.players[game.meIdx]) {
+      throw new Error("BuddyBoardGames current player is not readable");
+    }
+
+    const player = game.players[game.meIdx];
+    const rows = player.score?.rows || {};
+    const totalRow = rows[15];
+    const fallbackTotal = Object.entries(rows)
+      .filter(([key, row]) => key !== "15" && row && Number.isFinite(Number(row.value)))
+      .reduce((sum, [, row]) => sum + Number(row.value || 0), 0);
+    const score = Number(totalRow?.value);
+    const normalizedScore = Number.isFinite(score) ? score : fallbackTotal;
+    const signature = Object.entries(rows)
+      .map(([key, row]) => `${key}:${Number(row?.value || 0)}:${row?.selected ? 1 : 0}`)
+      .join(",");
+
+    return {
+      score: normalizedScore,
+      signature,
+    };
+  });
 }
 
 function runKeiriAdvice(tokens, options) {
@@ -341,6 +642,27 @@ function writeTrace(traceDir, event) {
   appendFileSync(file, `${JSON.stringify({ timestamp: new Date().toISOString(), ...event })}\n`);
 }
 
+async function waitWithStop(page, milliseconds, stopController) {
+  if (!stopController) {
+    await page.waitForTimeout(milliseconds);
+    return;
+  }
+  const slice = Math.max(50, Math.min(250, milliseconds));
+  let remaining = milliseconds;
+  while (remaining > 0 && !stopController.requested()) {
+    const delay = Math.min(slice, remaining);
+    try {
+      await page.waitForTimeout(delay);
+    } catch (error) {
+      if (stopController.requested()) {
+        return;
+      }
+      throw error;
+    }
+    remaining -= delay;
+  }
+}
+
 async function applyAdvice(page, advice) {
   if (advice.action.startsWith("roll")) {
     for (const die of advice.toggleDice) {
@@ -371,4 +693,206 @@ async function domClick(page, selector) {
     if (!element) throw new Error(`Missing selector ${selector}`);
     element.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
   }, selector);
+}
+
+function isMainModule() {
+  return Boolean(process.argv[1] && resolve(process.argv[1]) === modulePath);
+}
+
+function createStopController(options = {}) {
+  let requested = false;
+  let forceExit = false;
+  let reason = "";
+  let forceTimer = null;
+  const handlers = new Map();
+  const requestStop = (nextReason) => {
+    if (!requested) {
+      requested = true;
+      reason = nextReason;
+      options.onRequestStop?.(nextReason);
+      forceTimer = setTimeout(() => {
+        if (forceExit) {
+          return;
+        }
+        forceExit = true;
+        options.onForceStop?.(nextReason);
+        process.exit(130);
+      }, 4000);
+      forceTimer.unref?.();
+      return;
+    }
+    if (forceExit) {
+      return;
+    }
+    forceExit = true;
+    options.onForceStop?.(nextReason);
+    process.exit(130);
+  };
+
+  for (const signal of ["SIGINT", "SIGTERM"]) {
+    const handler = () => requestStop(signal);
+    handlers.set(signal, handler);
+    process.on(signal, handler);
+  }
+
+  return {
+    requested: () => requested,
+    reason: () => reason || "stop-requested",
+    dispose: () => {
+      if (forceTimer !== null) {
+        clearTimeout(forceTimer);
+      }
+      for (const [signal, handler] of handlers.entries()) {
+        process.off(signal, handler);
+      }
+      handlers.clear();
+    },
+  };
+}
+
+function compressScoresForGraph(scores, maxWidth) {
+  if (scores.length <= maxWidth) {
+    return scores.map((value, index) => ({ value, start: index + 1, end: index + 1 }));
+  }
+
+  const bucketSize = scores.length / maxWidth;
+  const points = [];
+  for (let column = 0; column < maxWidth; column += 1) {
+    const start = Math.floor(column * bucketSize);
+    const end = Math.min(scores.length, Math.floor((column + 1) * bucketSize));
+    const slice = scores.slice(start, Math.max(start + 1, end));
+    points.push({
+      value: meanScore(slice),
+      start: start + 1,
+      end: Math.max(start + 1, end),
+    });
+  }
+  return points;
+}
+
+function createLoopSession() {
+  const scores = [];
+  const signatures = new Set();
+  let summaryOutput = "";
+  let chartPath = "";
+  let chartUnavailableReason = "";
+
+  return {
+    recordScore(score, signature) {
+      if (signatures.has(signature)) {
+        return null;
+      }
+      signatures.add(signature);
+      scores.push(score);
+      return score;
+    },
+    scores: () => scores.slice(),
+    getCachedSummary(options = {}) {
+      if (summaryOutput) {
+        return summaryOutput;
+      }
+      return formatScoreSummary(scores, {
+        reason: options.reason,
+        chartPath,
+        chartUnavailableReason,
+      });
+    },
+    emitSummary(options = {}) {
+      if (summaryOutput) {
+        return "";
+      }
+      if (options.forceChartAttempt && !chartPath && !chartUnavailableReason && scores.length) {
+        const artifact = tryRenderScoreChart(scores);
+        if (artifact.ok) {
+          chartPath = artifact.path;
+        } else {
+          chartUnavailableReason = artifact.reason;
+        }
+      }
+      summaryOutput = formatScoreSummary(scores, {
+        reason: options.reason,
+        chartPath,
+        chartUnavailableReason,
+      });
+      return summaryOutput;
+    },
+  };
+}
+
+function tryRenderScoreChart(scores) {
+  const python = findPythonExecutable();
+  if (!python) {
+    return { ok: false, reason: "python3 not available" };
+  }
+
+  const reportsDir = resolve(repoRoot, "target/bbg-reports");
+  mkdirSync(reportsDir, { recursive: true });
+  const outputPath = join(reportsDir, `score-history-${timestampSlug()}.png`);
+  const plotScript = `
+import json
+import os
+import sys
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+except Exception as exc:
+    print(f"MATPLOTLIB_IMPORT_ERROR:{exc}", file=sys.stderr)
+    sys.exit(3)
+
+scores = json.loads(sys.argv[1])
+output_path = sys.argv[2]
+mean = sum(scores) / len(scores)
+x_values = list(range(1, len(scores) + 1))
+
+fig, ax = plt.subplots(figsize=(10, 4.8), dpi=160)
+ax.plot(x_values, scores, color="#1f77b4", linewidth=2, marker="o", markersize=4)
+ax.axhline(mean, color="#555555", linestyle="--", linewidth=1.5, label=f"Mean {mean:.2f}")
+ax.set_title("BuddyBoardGames Score History")
+ax.set_xlabel("Game")
+ax.set_ylabel("Score")
+ax.grid(True, axis="y", linestyle=":", linewidth=0.6, alpha=0.7)
+ax.legend(loc="best")
+fig.tight_layout()
+fig.savefig(output_path)
+print(output_path)
+`;
+
+  try {
+    const stdout = execFileSync(
+      python,
+      ["-c", plotScript, JSON.stringify(scores), outputPath],
+      { cwd: repoRoot, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    ).trim();
+    return { ok: true, path: stdout || outputPath };
+  } catch (error) {
+    const detail = String(error.stderr || error.message || "unknown python error").trim();
+    const normalized = detail.replace(/\s+/g, " ");
+    if (normalized.includes("MATPLOTLIB_IMPORT_ERROR")) {
+      return { ok: false, reason: "matplotlib not installed" };
+    }
+    return { ok: false, reason: normalized };
+  }
+}
+
+function findPythonExecutable() {
+  for (const candidate of [process.env.PYTHON, "python3", "python"]) {
+    if (!candidate) continue;
+    try {
+      execFileSync(candidate, ["-c", "import sys; print(sys.version_info[0])"], {
+        cwd: repoRoot,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      return candidate;
+    } catch {
+      continue;
+    }
+  }
+  return "";
+}
+
+function timestampSlug() {
+  return new Date().toISOString().replace(/[:.]/g, "-");
 }

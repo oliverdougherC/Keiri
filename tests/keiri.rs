@@ -263,6 +263,19 @@ fn buddyboardgames_snapshot_rejects_unsafe_or_malformed_states() {
 }
 
 #[test]
+fn buddyboardgames_snapshot_normalizes_yahtzee_bonus_row_total() {
+    let snapshot = BuddyBoardGamesSnapshot::parse_compact(
+        "state=STARTED me=0 turn=0 spectator=false pending=false dice=1,1,1,1,1 selected=0,0,0,0,0 rolls=0 rows=12:150:1,0:3:1",
+    )
+    .unwrap();
+
+    let state = snapshot.to_game_state().unwrap();
+
+    assert_eq!(state.sheet().score(Category::Yahtzee), Some(50));
+    assert_eq!(state.sheet().yahtzee_bonus_count(), 1);
+}
+
+#[test]
 fn buddyboardgames_advice_maps_actions_to_site_selectors() {
     let snapshot = BuddyBoardGamesSnapshot::parse_compact(
         "state=STARTED me=0 turn=0 spectator=false pending=false dice=1,2,3,4,5 selected=0,0,0,0,0 rolls=3 rows=0:3:1,1:6:1,2:9:1,3:12:1,4:15:1,5:18:1,7:20:1,8:0:1,9:25:1,10:30:1,11:40:1,12:0:1",
@@ -299,6 +312,79 @@ fn exact_buddyboardgames_advice_reports_exact_source() {
         }
     );
     assert_eq!(advice.client_row, Some(13));
+}
+
+#[test]
+fn buddyboardgames_roll_advice_maps_canonical_hold_to_page_dice() {
+    let snapshot = BuddyBoardGamesSnapshot::parse_compact(
+        "state=STARTED me=0 turn=0 spectator=false pending=false dice=6,2,2,6,5 selected=0,0,0,0,0 rolls=1 rows=0:0:0",
+    )
+    .unwrap();
+
+    let advice = keiri::BuddyBoardGamesAdvice::from_snapshot(
+        &snapshot,
+        Action::Roll { hold_mask: 0b00101 },
+        Some(7.407407),
+        DecisionSource::ExactTable,
+        snapshot.to_game_state().unwrap().to_compact(),
+        Vec::new(),
+    )
+    .unwrap();
+
+    assert_eq!(snapshot.dice.values(), [2, 2, 5, 6, 6]);
+    assert_eq!(snapshot.page_dice, [6, 2, 2, 6, 5]);
+    assert_eq!(advice.hold_mask, Some(0b00101));
+    assert_eq!(advice.page_hold_mask, Some(0b10010));
+    assert_eq!(advice.toggle_dice, vec![1, 4]);
+
+    let cli = advice.to_cli_lines();
+    assert!(cli.contains("hold_mask: 00101"));
+    assert!(cli.contains("page_hold_mask: 10010"));
+    assert!(cli.contains("toggle_dice: 1,4"));
+}
+
+#[test]
+fn buddyboardgames_roll_advice_prefers_selected_matching_duplicates() {
+    let snapshot = BuddyBoardGamesSnapshot::parse_compact(
+        "state=STARTED me=0 turn=0 spectator=false pending=false dice=6,2,2,6,5 selected=0,0,1,0,1 rolls=1 rows=0:0:0",
+    )
+    .unwrap();
+
+    let advice = keiri::BuddyBoardGamesAdvice::from_snapshot(
+        &snapshot,
+        Action::Roll { hold_mask: 0b00101 },
+        None,
+        DecisionSource::ExactTable,
+        snapshot.to_game_state().unwrap().to_compact(),
+        Vec::new(),
+    )
+    .unwrap();
+
+    assert_eq!(advice.hold_mask, Some(0b00101));
+    assert_eq!(advice.page_hold_mask, Some(0b10100));
+    assert!(advice.toggle_dice.is_empty());
+}
+
+#[test]
+fn buddyboardgames_roll_advice_uses_earliest_unselected_duplicate() {
+    let snapshot = BuddyBoardGamesSnapshot::parse_compact(
+        "state=STARTED me=0 turn=0 spectator=false pending=false dice=6,2,2,6,5 selected=0,0,0,0,0 rolls=1 rows=0:0:0",
+    )
+    .unwrap();
+
+    let advice = keiri::BuddyBoardGamesAdvice::from_snapshot(
+        &snapshot,
+        Action::Roll { hold_mask: 0b00001 },
+        None,
+        DecisionSource::ExactTable,
+        snapshot.to_game_state().unwrap().to_compact(),
+        Vec::new(),
+    )
+    .unwrap();
+
+    assert_eq!(advice.hold_mask, Some(0b00001));
+    assert_eq!(advice.page_hold_mask, Some(0b00010));
+    assert_eq!(advice.toggle_dice, vec![1]);
 }
 
 #[test]

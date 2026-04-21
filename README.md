@@ -19,7 +19,8 @@ cargo run -- simulate
 cargo run -- --simulate seed=42 verbose=true
 cargo simulate
 cargo run -- --bbg-join my-room-code
-cargo run -- bbg-join room=my-room-code player=keiri-bot play=true
+cargo run -- bbg-join room=my-room-code player=Keiri play=true
+cargo run -- bbg-loop room=my-room-code player=Keiri
 cargo run -- evaluate games=1000 seed=1 oracle_endgame=0 out=metrics/simulation_history.csv scores_out=metrics/scores.csv
 cargo run -- simulate rules=buddyboardgames agent=auto table=target/keiri_tables/bbg-anchor-v1.bin seed=42
 cargo run -- score full-house 2,2,3,3,3
@@ -115,7 +116,7 @@ To join a BuddyBoardGames Yahtzee lobby directly from Keiri:
 cargo run -- --bbg-join my-room-code
 ```
 
-That opens a headed browser, enters the room code, joins as `keiri-bot`, and
+That opens a headed browser, enters the room code, joins as `Keiri`, and
 plays whenever it is Keiri's turn. If the exact table has not been built yet,
 Keiri builds it with the optimized release binary, prints layer progress, saves
 layer checkpoints to `<table>.partial`, saves the final table atomically,
@@ -124,8 +125,7 @@ table build on an M4 Pro is expected to complete in seconds rather than hours,
 and the verified opening expected value is `254.589609`. Interrupted builds
 resume from the latest compatible completed layer. If the room did not exist and
 Keiri is alone in the lobby, the helper starts the game automatically and plays
-the solo game to completion. Leave the process running; stop it with Ctrl-C. If
-you omit the room code, Keiri prompts for it:
+the solo game to completion. If you omit the room code, Keiri prompts for it:
 
 ```bash
 cargo run -- --bbg-join
@@ -134,15 +134,34 @@ cargo run -- --bbg-join
 Options:
 
 ```bash
-cargo run -- bbg-join room=my-room-code player=keiri-bot play=true start=false
-cargo run -- bbg-join room=my-room-code player=keiri-bot play=false
+cargo run -- bbg-join room=my-room-code player=Keiri play=true start=false
+cargo run -- bbg-join room=my-room-code player=Keiri play=false
 ```
+
+To keep rematching indefinitely in the same BuddyBoardGames room and grind solo
+games for the leaderboard:
+
+```bash
+cargo run -- bbg-loop room=my-room-code player=Keiri
+```
+
+When you stop `bbg-loop` with Ctrl-C or `kill`/`SIGTERM`, Keiri now requests a
+graceful stop, finishes the current loop step, and prints a session summary with
+completed game count, highest score, and mean score. If Python plus
+`matplotlib` are available, it also renders a PNG score-history chart with a
+dashed mean line under `target/bbg-reports/`; otherwise it falls back to a
+terminal graph.
 
 For browser use, run the Playwright helper in dry-run mode first:
 
 ```bash
 npx --yes --package playwright node tools/buddyboardgames/autoplay.mjs --dry-run --url=https://www.buddyboardgames.com/yahtzee
 ```
+
+When the page is still in `DEMO`, `LOBBY`, spectator mode, or otherwise not
+actionable, the helper reports a guarded `status: waiting` line instead of
+crashing. To inspect advice in a brand-new solo room, pass
+`--player=<name> --room=<code> --start-game`.
 
 Use `--execute` only in your own room when you want it to click the advised
 hold/roll/score action.

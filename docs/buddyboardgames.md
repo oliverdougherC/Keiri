@@ -80,14 +80,26 @@ if Keiri is the only player there, the helper starts it automatically and plays
 the solo game to completion:
 
 ```bash
-cargo run -- bbg-join room=my-room-code player=keiri-bot play=true
+cargo run -- bbg-join room=my-room-code player=Keiri play=true
 ```
 
 To only join and wait without playing:
 
 ```bash
-cargo run -- bbg-join room=my-room-code player=keiri-bot play=false
+cargo run -- bbg-join room=my-room-code player=Keiri play=false
 ```
+
+To keep rematching and replaying solo games in the same room:
+
+```bash
+cargo run -- bbg-loop room=my-room-code player=Keiri
+```
+
+Stop the loop with Ctrl-C or `SIGTERM` to get a final session summary. The
+helper now requests a graceful stop first, then reports the number of completed
+games, the highest score seen, and the mean score. If Python plus `matplotlib`
+are available, it writes a PNG score-history chart with a dashed mean line to
+`target/bbg-reports/`; otherwise it falls back to a terminal graph.
 
 Dry run:
 
@@ -95,13 +107,18 @@ Dry run:
 npx --yes --package playwright node tools/buddyboardgames/autoplay.mjs --dry-run --url=https://www.buddyboardgames.com/yahtzee
 ```
 
+The default landing page is often in `DEMO` or `LOBBY`, so dry-run now reports a
+guarded waiting status instead of failing. To force a brand-new solo room into a
+live game before asking for advice, add `--player`, `--room`, and `--start-game`.
+
 Join a room and inspect the recommendation:
 
 ```bash
 npx --yes --package playwright node tools/buddyboardgames/autoplay.mjs \
   --dry-run \
-  --player=keiri-bot \
-  --room=my-room
+  --player=Keiri \
+  --room=my-room \
+  --start-game
 ```
 
 Execute one guarded action:
@@ -109,7 +126,7 @@ Execute one guarded action:
 ```bash
 npx --yes --package playwright node tools/buddyboardgames/autoplay.mjs \
   --execute \
-  --player=keiri-bot \
+  --player=Keiri \
   --room=my-room
 ```
 

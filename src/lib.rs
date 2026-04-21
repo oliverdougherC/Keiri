@@ -2795,7 +2795,8 @@ impl<'a> HeuristicTurnEvaluator<'a> {
 
                 let still_possible = {
                     let subtotal = state.sheet().upper_subtotal() + result.base_score;
-                    let max_remaining = Category::UPPER.iter()
+                    let max_remaining = Category::UPPER
+                        .iter()
                         .filter(|u| **u != category && !state.sheet().is_filled(**u))
                         .copied()
                         .map(Rules::max_base_score)
@@ -2805,9 +2806,11 @@ impl<'a> HeuristicTurnEvaluator<'a> {
 
                 if still_possible {
                     // Per-slot credit: spread bonus value across remaining unfilled upper slots
-                    let slots = (Category::UPPER.iter()
+                    let slots = (Category::UPPER
+                        .iter()
                         .filter(|u| **u != category && !state.sheet().is_filled(**u))
-                        .count() as f64).max(1.0);
+                        .count() as f64)
+                        .max(1.0);
                     let bonus_per_slot = UPPER_BONUS as f64 * (0.25 + 0.4 * time_ratio) / slots;
                     utility += bonus_per_slot;
                 } else {
@@ -2995,6 +2998,7 @@ pub struct BuddyBoardGamesSnapshot {
     pub roll_pending: bool,
     pub rolls_used: u8,
     pub dice: Dice,
+    pub page_dice: [u8; DICE_COUNT],
     pub selected_dice: [bool; DICE_COUNT],
     pub rows: Vec<BuddyBoardGamesRow>,
 }
@@ -3005,11 +3009,15 @@ pub struct BuddyBoardGamesAdvice {
     pub category: Option<Category>,
     pub client_row: Option<usize>,
     pub hold_mask: Option<u8>,
+    pub page_hold_mask: Option<u8>,
     pub toggle_dice: Vec<usize>,
     pub selector: String,
     pub expected_value: Option<f64>,
     pub source: DecisionSource,
     pub state_compact: String,
+    pub upper_subtotal: u16,
+    pub upper_bonus_needed: u16,
+    pub remaining_upper: Vec<Category>,
     pub alternatives: Vec<Decision>,
 }
 
@@ -3063,7 +3071,8 @@ impl BuddyBoardGamesSnapshot {
             if row.selected
                 && let Some(category) = bbg_client_row_to_category(row.client_row)
             {
-                sheet.fill_validated(category, row.value)?;
+                let value = normalize_bbg_recorded_score(category, row.value, &mut sheet)?;
+                sheet.fill_validated(category, value)?;
             }
         }
         let dice = (self.rolls_used > 0).then_some(self.dice);
@@ -3081,6 +3090,52 @@ impl BuddyBoardGamesSnapshot {
                 },
             )
     }
+
+    fn page_hold_mask_for_canonical(&self, hold_mask: u8) -> Result<u8, KeiriError> {
+        validate_hold_mask(hold_mask)?;
+        let held = self.dice.kept_by_mask(hold_mask)?;
+        let mut needed = [0u8; 7];
+        for value in held {
+            needed[usize::from(value)] += 1;
+        }
+
+        let mut page_mask = 0u8;
+        for selected in [true, false] {
+            for (index, value) in self.page_dice.iter().enumerate() {
+                if self.selected_dice[index] != selected || needed[usize::from(*value)] == 0 {
+                    continue;
+                }
+                page_mask |= 1 << index;
+                needed[usize::from(*value)] -= 1;
+            }
+        }
+
+        if needed.iter().any(|count| *count > 0) {
+            return Err(KeiriError::InvalidBuddyBoardGamesSnapshot(
+                "canonical hold mask cannot be mapped to page dice".to_string(),
+            ));
+        }
+
+        Ok(page_mask)
+    }
+}
+
+fn normalize_bbg_recorded_score(
+    category: Category,
+    value: u16,
+    sheet: &mut ScoreSheet,
+) -> Result<u16, KeiriError> {
+    if category != Category::Yahtzee || value <= 50 {
+        return Ok(value);
+    }
+    if !(value - 50).is_multiple_of(YAHTZEE_BONUS) {
+        return Err(KeiriError::InvalidRecordedScore {
+            category,
+            score: value,
+        });
+    }
+    sheet.set_yahtzee_bonus_count((value - 50) / YAHTZEE_BONUS);
+    Ok(50)
 }
 
 impl BuddyBoardGamesAdvice {
@@ -3092,23 +3147,37 @@ impl BuddyBoardGamesAdvice {
         state_compact: String,
         alternatives: Vec<Decision>,
     ) -> Result<Self, KeiriError> {
+        let state = snapshot.to_game_state()?;
+        let upper_subtotal = state.sheet().upper_subtotal();
+        let upper_bonus_needed = UPPER_BONUS_THRESHOLD.saturating_sub(upper_subtotal);
+        let remaining_upper = Category::UPPER
+            .iter()
+            .copied()
+            .filter(|category| !state.sheet().is_filled(*category))
+            .collect::<Vec<_>>();
+
         match action {
             Action::Roll { hold_mask } => {
                 validate_hold_mask(hold_mask)?;
+                let page_hold_mask = snapshot.page_hold_mask_for_canonical(hold_mask)?;
                 let current = snapshot.current_hold_mask();
                 let toggle_dice = (0..DICE_COUNT)
-                    .filter(|index| ((current ^ hold_mask) & (1 << index)) != 0)
+                    .filter(|index| ((current ^ page_hold_mask) & (1 << index)) != 0)
                     .collect::<Vec<_>>();
                 Ok(Self {
                     action,
                     category: None,
                     client_row: None,
                     hold_mask: Some(hold_mask),
+                    page_hold_mask: Some(page_hold_mask),
                     toggle_dice,
                     selector: "#roll-dice".to_string(),
                     expected_value,
                     source,
                     state_compact,
+                    upper_subtotal,
+                    upper_bonus_needed,
+                    remaining_upper,
                     alternatives,
                 })
             }
@@ -3123,11 +3192,15 @@ impl BuddyBoardGamesAdvice {
                     category: Some(category),
                     client_row: Some(row),
                     hold_mask: None,
+                    page_hold_mask: None,
                     toggle_dice: Vec::new(),
                     selector: format!("#player-{}-scoreboard-row-{row}", snapshot.me_idx),
                     expected_value,
                     source,
                     state_compact,
+                    upper_subtotal,
+                    upper_bonus_needed,
+                    remaining_upper,
                     alternatives,
                 })
             }
@@ -3141,6 +3214,20 @@ impl BuddyBoardGamesAdvice {
         if let Some(value) = self.expected_value {
             lines.push(format!("expected_value: {value:.6}"));
         }
+        lines.push(format!("upper_subtotal: {}", self.upper_subtotal));
+        lines.push(format!("upper_bonus_needed: {}", self.upper_bonus_needed));
+        lines.push(format!(
+            "remaining_upper: {}",
+            if self.remaining_upper.is_empty() {
+                "none".to_string()
+            } else {
+                self.remaining_upper
+                    .iter()
+                    .map(Category::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }
+        ));
         if let Some(category) = self.category {
             lines.push(format!("category: {category}"));
         }
@@ -3149,6 +3236,9 @@ impl BuddyBoardGamesAdvice {
         }
         if let Some(mask) = self.hold_mask {
             lines.push(format!("hold_mask: {mask:05b}"));
+        }
+        if let Some(mask) = self.page_hold_mask {
+            lines.push(format!("page_hold_mask: {mask:05b}"));
         }
         if !self.toggle_dice.is_empty() {
             lines.push(format!(
@@ -3394,6 +3484,7 @@ where
     let mut roll_pending = false;
     let mut rolls_used = None;
     let mut dice = None;
+    let mut page_dice = None;
     let mut selected_dice = None;
     let mut rows = None;
 
@@ -3412,7 +3503,11 @@ where
                     KeiriError::ParseError(format!("invalid rolls value `{value}`"))
                 })?)
             }
-            "dice" => dice = Some(Dice::parse(value)?),
+            "dice" => {
+                let ordered = parse_ordered_dice(value)?;
+                page_dice = Some(ordered);
+                dice = Some(Dice::new(ordered)?);
+            }
             "selected" | "held" => selected_dice = Some(parse_selected_dice(value)?),
             "rows" => rows = Some(parse_bbg_rows(value)?),
             other => {
@@ -3437,6 +3532,9 @@ where
         dice: dice.ok_or_else(|| {
             KeiriError::InvalidBuddyBoardGamesSnapshot("missing dice".to_string())
         })?,
+        page_dice: page_dice.ok_or_else(|| {
+            KeiriError::InvalidBuddyBoardGamesSnapshot("missing dice".to_string())
+        })?,
         selected_dice: selected_dice.unwrap_or([false; DICE_COUNT]),
         rows: rows.ok_or_else(|| {
             KeiriError::InvalidBuddyBoardGamesSnapshot("missing rows".to_string())
@@ -3444,6 +3542,24 @@ where
     };
     snapshot.validate_turn()?;
     Ok(snapshot)
+}
+
+fn parse_ordered_dice(value: &str) -> Result<[u8; DICE_COUNT], KeiriError> {
+    let values = value
+        .split(',')
+        .map(|part| {
+            let value = part.trim().parse::<u8>().map_err(|_| {
+                KeiriError::ParseError(format!("invalid die value `{}`", part.trim()))
+            })?;
+            if !(1..=6).contains(&value) {
+                return Err(KeiriError::InvalidDie(value));
+            }
+            Ok(value)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    values
+        .try_into()
+        .map_err(|values: Vec<u8>| KeiriError::InvalidDiceCount(values.len()))
 }
 
 fn parse_usize_field(name: &str, value: &str) -> Result<usize, KeiriError> {

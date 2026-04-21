@@ -14,6 +14,7 @@ use keiri::{
 
 const BBG_OPENING_EXPECTED_VALUE: f64 = 254.5896;
 const OPENING_EXPECTED_VALUE_TOLERANCE: f64 = 0.001;
+const DEFAULT_BBG_PLAYER: &str = "Keiri";
 
 fn main() {
     if let Err(error) = run(env::args().skip(1).collect()) {
@@ -33,6 +34,7 @@ fn run(args: Vec<String>) -> Result<(), KeiriError> {
     match command {
         "--simulate" | "simulate" => simulate_command(&args[1..]),
         "--bbg-join" | "bbg-join" => bbg_join_command(&args[1..]),
+        "--bbg-loop" | "bbg-loop" => bbg_loop_command(&args[1..]),
         "evaluate" | "eval" => evaluate_command(&args[1..]),
         "score" => score_command(&args[1..]),
         "actions" => actions_command(&args[1..]),
@@ -49,8 +51,16 @@ fn run(args: Vec<String>) -> Result<(), KeiriError> {
 }
 
 fn bbg_join_command(args: &[String]) -> Result<(), KeiriError> {
+    run_bbg_command(args, false)
+}
+
+fn bbg_loop_command(args: &[String]) -> Result<(), KeiriError> {
+    run_bbg_command(args, true)
+}
+
+fn run_bbg_command(args: &[String], restart_games: bool) -> Result<(), KeiriError> {
     let mut room = None;
-    let mut player = "keiri-bot".to_string();
+    let mut player = DEFAULT_BBG_PLAYER.to_string();
     let mut url = None;
     let mut start_game = false;
     let mut keep_open = true;
@@ -109,6 +119,12 @@ fn bbg_join_command(args: &[String]) -> Result<(), KeiriError> {
         }
     }
 
+    if restart_games && !play {
+        return Err(KeiriError::ParseError(
+            "bbg-loop requires play=true".to_string(),
+        ));
+    }
+
     let room = match room {
         Some(room) if !room.trim().is_empty() => room,
         _ => prompt_for_room_code()?,
@@ -128,6 +144,9 @@ fn bbg_join_command(args: &[String]) -> Result<(), KeiriError> {
         command.arg("--loop").arg("--execute");
     } else {
         command.arg("--join-only");
+    }
+    if restart_games {
+        command.arg("--restart-games");
     }
     command.arg(format!("--room={room}"));
     command.arg(format!("--player={player}"));
@@ -1129,8 +1148,10 @@ fn print_usage() {
 USAGE:
   keiri simulate [seed=<u64>] [verbose=true] [rules=hasbro|buddyboardgames] [agent=auto|hybrid|heuristic|exact-table] [table=<path>] [oracle_endgame=2]
   keiri --simulate [seed=<u64>] [verbose=true] [rules=hasbro|buddyboardgames] [agent=auto|hybrid|heuristic|exact-table] [table=<path>] [oracle_endgame=2]
-  keiri --bbg-join <room-code> [player=keiri-bot] [play=true] [start=false]
-  keiri bbg-join [room=<room-code>] [player=keiri-bot] [play=true] [start=false]
+  keiri --bbg-join <room-code> [player=Keiri] [play=true] [start=false]
+  keiri bbg-join [room=<room-code>] [player=Keiri] [play=true] [start=false]
+  keiri --bbg-loop <room-code> [player=Keiri] [start=false]
+  keiri bbg-loop [room=<room-code>] [player=Keiri] [start=false]
   keiri evaluate [games=100] [seed=1] [rules=hasbro|buddyboardgames] [agent=auto|hybrid|heuristic|exact-table] [table=<path>] [oracle_endgame=0] [out=metrics/simulation_history.csv] [scores_out=<path>]
   keiri score <category> <dice>
   keiri actions <state>
@@ -1144,7 +1165,8 @@ EXAMPLES:
   keiri --simulate seed=42 verbose=true
   keiri simulate rules=buddyboardgames agent=auto table=target/keiri_tables/bbg-anchor-v1.bin
   keiri --bbg-join my-room-code
-  keiri bbg-join room=my-room-code player=keiri-bot play=true
+  keiri bbg-join room=my-room-code player=Keiri play=true
+  keiri bbg-loop room=my-room-code player=Keiri
   keiri evaluate games=1000 seed=1 out=metrics/simulation_history.csv scores_out=metrics/scores.csv
   keiri evaluate rules=buddyboardgames games=1000 seed=1 agent=auto table=target/keiri_tables/bbg-anchor-v1.bin out=none
   keiri score full-house 2,2,3,3,3
